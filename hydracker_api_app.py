@@ -478,6 +478,29 @@ class LinkToNzbWorkflow:
         }
         return self._sync_liens(title_id, liens, existing_lien_ids)
 
+    def sync_lien(self, lien_id: str) -> dict[str, Any]:
+        lien_id = str(lien_id).strip()
+        if not lien_id:
+            raise ValueError("Lien ID is required")
+        self._log(f"sync-lien lien_id={lien_id}")
+        source = self.hydra.get_lien(lien_id, streaming=False)
+        source_lien = source.get("lien") if isinstance(source.get("lien"), dict) else {}
+        title_id = parse_optional_int(source_lien.get("title_id"))
+        if not title_id:
+            raise ValueError(f"Cannot resolve title_id for lien_id={lien_id}")
+
+        liens = self.hydra.list_all_title_liens(title_id, host=ONEFICHIER_HOST_ID)
+        lien = next((item for item in liens if str(item.get("id") or item.get("lien_id") or "") == lien_id), None)
+        if lien is None:
+            lien = dict(source_lien)
+        lien["_source_response"] = source
+        existing_lien_ids = {
+            str(nzb["lien_id"])
+            for nzb in self.hydra.list_all_title_nzbs(title_id)
+            if isinstance(nzb, dict) and nzb.get("lien_id")
+        }
+        return self._sync_liens(title_id, [lien], existing_lien_ids)
+
     def sync_category(
         self,
         *,
@@ -537,7 +560,7 @@ class LinkToNzbWorkflow:
                 continue
 
             try:
-                source = self.hydra.get_lien(lien_id, streaming=False)
+                source = lien.get("_source_response") if isinstance(lien.get("_source_response"), dict) else self.hydra.get_lien(lien_id, streaming=False)
                 direct_url = extract_direct_dl_url(source)
                 raw_url = extract_raw_url(source)
                 downloaded: Path | None = None
@@ -1058,6 +1081,10 @@ def build_parser() -> argparse.ArgumentParser:
     sync_title.add_argument("--query")
     sync_title.add_argument("--limit", type=int)
 
+    sync_lien = sub.add_parser("sync-lien", help="Download one 1fichier link by lien_id, build NZB, upload with lien_id dedupe.")
+    sync_lien.add_argument("id", help="Hydracker direct-link ID.")
+    add_workflow_args(sync_lien)
+
     sync_category = sub.add_parser("sync-category", help="Run sync-title for titles from a category/filter.")
     add_workflow_args(sync_category)
     sync_category.add_argument("--genre")
@@ -1184,6 +1211,9 @@ def cli(argv: list[str]) -> int:
         return 0
     if args.command == "sync-title":
         print(pretty(workflow_from_args(args).sync_title(args.title, query=args.query, limit=args.limit)), end="")
+        return 0
+    if args.command == "sync-lien":
+        print(pretty(workflow_from_args(args).sync_lien(args.id)), end="")
         return 0
     if args.command == "sync-category":
         print(pretty(workflow_from_args(args).sync_category(
@@ -1837,6 +1867,9 @@ def launch_gui(force: bool = False) -> int:
     def do_sync_title() -> dict[str, Any]:
         return workflow_from_form().sync_title(title_ref.get().strip())
 
+    def do_sync_lien() -> dict[str, Any]:
+        return workflow_from_form().sync_lien(link_id.get().strip())
+
     def do_sync_channel_page() -> dict[str, Any]:
         channel_data = do_browse_category()
         titles = extract_display_titles(channel_data)
@@ -1860,7 +1893,9 @@ def launch_gui(force: bool = False) -> int:
             return do_sync_title()
         if selected == "category":
             return do_sync_channel_page()
-        raise ValueError("Le sync auto est disponible en mode Title ID/URL ou Categorie.")
+        if selected == "lien":
+            return do_sync_lien()
+        raise ValueError("Le sync auto est disponible en mode Title ID/URL, Categorie ou Lien ID.")
 
     def do_run_selected() -> dict[str, Any]:
         selected = mode.get()
