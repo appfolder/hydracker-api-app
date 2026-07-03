@@ -15,6 +15,7 @@ import mimetypes
 import os
 import platform
 import re
+import secrets
 import shlex
 import ssl
 import subprocess
@@ -23,7 +24,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -39,6 +40,8 @@ DEFAULT_ONEFICHIER_BASE_URL = "https://api.1fichier.com/v1"
 ONEFICHIER_HOST_ID = 5
 SETTINGS_PATH = Path.home() / ".config" / "hydracker-api-app" / "settings.json"
 Logger = Callable[[str], None]
+NZB_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789"
+NZB_PASSWORD_LENGTH = 10
 
 
 class ApiError(RuntimeError):
@@ -81,6 +84,7 @@ class NyuuConfig:
     groups: str = "alt.binaries.multimedia"
     connections: int = 3
     from_: str = ""
+    nzb_password: str = ""
 
 
 class HydrackerApiClient:
@@ -691,8 +695,9 @@ class LinkToNzbWorkflow:
                 if downloaded is None:
                     results.append({"status": "failed", "reason": "no_directdl_or_raw_url_from_api", "lien_id": lien_id, "source": source})
                     continue
+                nzb_password = generate_nzb_password()
                 self._log(f"build NZB lien_id={lien_id}")
-                nzb_path = self._build_nzb(downloaded, lien_id)
+                nzb_path = self._build_nzb(downloaded, lien_id, password=nzb_password)
                 self._log(f"upload NZB lien_id={lien_id} path={nzb_path}")
                 created = self.hydra.create_nzb(
                     title_id=title_id,
@@ -701,7 +706,7 @@ class LinkToNzbWorkflow:
                     lien_id=lien_id,
                     nzb_path=str(nzb_path),
                     subs=infer_subs(lien),
-                    password=str(lien.get("password") or ""),
+                    password=nzb_password,
                     full_saison=bool(lien.get("full_saison")),
                     saison=parse_optional_int(lien.get("saison")),
                     episode=parse_optional_int(lien.get("episode")),
@@ -739,12 +744,13 @@ class LinkToNzbWorkflow:
         except Exception as exc:
             self._log(f"cleanup failed for {downloaded}: {type(exc).__name__}: {exc}")
 
-    def _build_nzb(self, downloaded: Path, lien_id: str) -> Path:
+    def _build_nzb(self, downloaded: Path, lien_id: str, *, password: str = "") -> Path:
         if self.nyuu.enabled:
             output_dir = self.nzb_dir or downloaded.parent
             output_dir.mkdir(parents=True, exist_ok=True)
             nzb_path = unique_path(output_dir / f"{downloaded.stem}.nzb")
-            config_path = write_nyuu_config(self.nyuu, downloaded, nzb_path)
+            config = dataclasses_replace(self.nyuu, nzb_password=password)
+            config_path = write_nyuu_config(config, downloaded, nzb_path)
             try:
                 command = build_nyuu_command(self.nyuu, downloaded, config_path)
                 self._log(f"Nyuu posting {downloaded.name}")
@@ -1064,6 +1070,11 @@ def find_first_url(data: Any) -> str:
     return ""
 
 
+def generate_nzb_password(length: int = NZB_PASSWORD_LENGTH) -> str:
+    length = max(1, min(10, length))
+    return "".join(secrets.choice(NZB_PASSWORD_ALPHABET) for _ in range(length))
+
+
 def filename_from_response(content_disposition: str | None, url: str) -> str:
     if content_disposition:
         match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', content_disposition)
@@ -1148,6 +1159,8 @@ def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path) -> s
         data["port"] = config.port
     if config.from_:
         data["from"] = config.from_
+    if config.nzb_password:
+        data["nzb-password"] = config.nzb_password
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".nyuu.json", delete=False) as fh:
         json.dump(data, fh)
         fh.write("\n")
