@@ -1009,8 +1009,6 @@ def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path) -> s
 
 def build_nyuu_command(config: NyuuConfig, input_path: Path, config_path: str) -> list[str]:
     command = shlex.split(config.bin)
-    if command and Path(command[0]).name in {"npx", "npm", "npm.cmd", "npx.cmd"} and "--" not in command:
-        command.append("--")
     command.extend(["--config", config_path])
     command.append(str(input_path))
     return command
