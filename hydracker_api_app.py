@@ -1011,19 +1011,27 @@ def unique_path(path: Path) -> Path:
 
 
 def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path) -> str:
-    if not config.host:
+    host = config.host.strip()
+    user = config.user.strip()
+    password = config.password.strip()
+    groups = config.groups.strip() or "alt.binaries.multimedia"
+    if not host:
         raise RuntimeError("Nyuu requires --usenet-host or HYDRA_USENET_HOST.")
-    if not config.user:
+    if not user:
         raise RuntimeError("Nyuu requires --usenet-user or HYDRA_USENET_USER.")
-    if not config.password:
+    if not password:
         raise RuntimeError("Nyuu requires --usenet-password or HYDRA_USENET_PASSWORD.")
+    if "@" in host:
+        raise RuntimeError("Usenet host looks like an email. Use host=reader2.newsxs.nl and user=your account email.")
+    if "." in user and "@" not in user:
+        raise RuntimeError("Usenet user looks like a hostname. Check that host and user are not swapped.")
     data: dict[str, Any] = {
-        "host": config.host,
+        "host": host,
         "ssl": config.ssl,
-        "user": config.user,
-        "password": config.password,
+        "user": user,
+        "password": password,
         "connections": config.connections,
-        "groups": config.groups,
+        "groups": groups,
         "out": str(nzb_path),
         "overwrite": True,
         "nzb-title": input_path.stem,
