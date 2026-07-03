@@ -470,6 +470,7 @@ class LinkToNzbWorkflow:
         dry_run: bool = False,
         fallback_qualite: int | None = None,
         fallback_langues: list[str] | None = None,
+        cleanup_downloads: bool = True,
         logger: Logger | None = None,
     ):
         self.hydra = hydra
@@ -481,6 +482,7 @@ class LinkToNzbWorkflow:
         self.dry_run = dry_run
         self.fallback_qualite = fallback_qualite
         self.fallback_langues = fallback_langues or []
+        self.cleanup_downloads = cleanup_downloads
         self.logger = logger
 
     def sync_title(self, title_ref: str, *, query: str | None = None, limit: int | None = None) -> dict[str, Any]:
@@ -554,6 +556,82 @@ class LinkToNzbWorkflow:
                 except Exception as exc:
                     results.append({"title": title, "error": f"{type(exc).__name__}: {exc}"})
         return {"results": results}
+
+    def sync_channel(
+        self,
+        channel_id: int,
+        *,
+        start_page: int = 1,
+        max_pages: int | None = None,
+        limit_per_title: int | None = None,
+        keep_results: bool = False,
+    ) -> dict[str, Any]:
+        page = max(1, start_page)
+        processed_pages = 0
+        totals = {"titles": 0, "uploaded": 0, "skipped": 0, "failed": 0}
+        results: list[dict[str, Any]] = []
+        last_page_result: dict[str, Any] | None = None
+        while True:
+            if max_pages is not None and processed_pages >= max_pages:
+                break
+            self._log(f"sync-channel channel_id={channel_id} page={page}")
+            try:
+                channel_data = self.hydra.get_channel_content(channel_id, page=page)
+            except Exception as exc:
+                self._log(f"sync-channel page={page} failed: {type(exc).__name__}: {exc}")
+                page_error = {"page": page, "error": f"{type(exc).__name__}: {exc}"}
+                last_page_result = page_error
+                if keep_results:
+                    results.append(page_error)
+                page += 1
+                processed_pages += 1
+                continue
+
+            titles = extract_pagination_items(channel_data)
+            if not titles:
+                self._log(f"sync-channel no titles on page={page}; stopping")
+                break
+
+            page_result: dict[str, Any] = {"page": page, "titles": len(titles), "results": []}
+            for index, title in enumerate(titles, start=1):
+                title_id = title.get("id") if isinstance(title, dict) else None
+                if not title_id:
+                    page_result["results"].append({"status": "skipped", "reason": "missing_title_id", "title": title})
+                    totals["skipped"] += 1
+                    continue
+                totals["titles"] += 1
+                self._log(f"sync-channel page={page} title {index}/{len(titles)} title_id={title_id}")
+                try:
+                    result = self.sync_title(str(title_id), limit=limit_per_title)
+                    page_result["results"].append({"title_id": title_id, "result": result})
+                    for item in result.get("results", []):
+                        status = item.get("status") if isinstance(item, dict) else None
+                        if status == "uploaded":
+                            totals["uploaded"] += 1
+                        elif status == "failed":
+                            totals["failed"] += 1
+                        elif status == "skipped":
+                            totals["skipped"] += 1
+                except Exception as exc:
+                    self._log(f"sync-channel title_id={title_id} failed: {type(exc).__name__}: {exc}")
+                    page_result["results"].append({"title_id": title_id, "error": f"{type(exc).__name__}: {exc}"})
+                    totals["failed"] += 1
+            last_page_result = page_result
+            if keep_results:
+                results.append(page_result)
+
+            pagination = channel_data.get("pagination") if isinstance(channel_data, dict) else None
+            next_page = parse_optional_int(pagination.get("next_page")) if isinstance(pagination, dict) else None
+            processed_pages += 1
+            if not next_page:
+                break
+            page = next_page
+        payload: dict[str, Any] = {"channel_id": channel_id, "start_page": start_page, "processed_pages": processed_pages, "totals": totals}
+        if keep_results:
+            payload["results"] = results
+        elif last_page_result is not None:
+            payload["last_page"] = last_page_result
+        return payload
 
     def _sync_liens(
         self,
@@ -629,6 +707,8 @@ class LinkToNzbWorkflow:
                     episode=parse_optional_int(lien.get("episode")),
                 )
                 existing_lien_ids.add(lien_id)
+                if self.cleanup_downloads:
+                    self._cleanup_download(downloaded)
                 results.append({
                     "status": "uploaded",
                     "lien_id": lien_id,
@@ -646,6 +726,18 @@ class LinkToNzbWorkflow:
                     "error": str(exc),
                 })
         return {"title_id": title_id, "count": len(liens), "results": results}
+
+    def _cleanup_download(self, downloaded: Path) -> None:
+        try:
+            root = self.download_dir.resolve()
+            target = downloaded.resolve()
+            if root == target or root not in target.parents:
+                self._log(f"cleanup skipped outside download dir: {downloaded}")
+                return
+            target.unlink(missing_ok=True)
+            self._log(f"cleanup deleted downloaded file {downloaded}")
+        except Exception as exc:
+            self._log(f"cleanup failed for {downloaded}: {type(exc).__name__}: {exc}")
 
     def _build_nzb(self, downloaded: Path, lien_id: str) -> Path:
         if self.nyuu.enabled:
@@ -1146,6 +1238,14 @@ def build_parser() -> argparse.ArgumentParser:
     sync_category.add_argument("--per-page", type=int, default=50)
     sync_category.add_argument("--limit-per-title", type=int)
 
+    sync_channel = sub.add_parser("sync-channel", help="Run sync-title for every title in a channel, page by page.")
+    sync_channel.add_argument("channel", type=int, help="Hydracker channel ID.")
+    add_workflow_args(sync_channel)
+    sync_channel.add_argument("--start-page", type=int, default=1)
+    sync_channel.add_argument("--max-pages", type=int)
+    sync_channel.add_argument("--limit-per-title", type=int)
+    sync_channel.add_argument("--store-results", action="store_true", help="Keep full per-title results in memory and final JSON output.")
+
     return parser
 
 
@@ -1170,6 +1270,7 @@ def add_workflow_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--usenet-connections", default=os.getenv("HYDRA_USENET_CONNECTIONS", "3"))
     parser.add_argument("--usenet-from", default=os.getenv("HYDRA_USENET_FROM", ""))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--keep-downloads", action="store_true", help="Do not delete downloaded files after a successful Hydracker NZB upload.")
     parser.add_argument("--qualite", type=int, help="Fallback quality ID when the link metadata has no quality.")
     parser.add_argument("--langues", default="", help="Fallback comma-separated languages, e.g. TrueFrench,English.")
 
@@ -1200,6 +1301,8 @@ def workflow_from_args(args: argparse.Namespace) -> LinkToNzbWorkflow:
         dry_run=args.dry_run,
         fallback_qualite=args.qualite,
         fallback_langues=split_csv(args.langues),
+        cleanup_downloads=not args.keep_downloads,
+        logger=print,
     )
 
 
@@ -1275,6 +1378,15 @@ def cli(argv: list[str]) -> int:
             pages=args.pages,
             per_page=args.per_page,
             limit_per_title=args.limit_per_title,
+        )), end="")
+        return 0
+    if args.command == "sync-channel":
+        print(pretty(workflow_from_args(args).sync_channel(
+            args.channel,
+            start_page=args.start_page,
+            max_pages=args.max_pages,
+            limit_per_title=args.limit_per_title,
+            keep_results=args.store_results,
         )), end="")
         return 0
 
