@@ -535,55 +535,65 @@ class LinkToNzbWorkflow:
                 results.append({"status": "dry_run", "lien_id": lien_id, "title_id": title_id, "qualite": qualite, "langues": langues})
                 continue
 
-            source = self.hydra.get_lien(lien_id, streaming=False)
-            direct_url = extract_direct_dl_url(source)
-            raw_url = extract_raw_url(source)
-            downloaded: Path | None = None
-            if direct_url:
-                self._log(f"download lien_id={lien_id} via directDL")
-                try:
-                    downloaded = DirectDownloadClient(
-                        self.hydra.config.user_agent,
-                        insecure_tls=self.hydra.config.insecure_tls,
-                        logger=self.logger,
-                    ).download(direct_url, self.download_dir)
-                except DownloadError as exc:
-                    self._log(f"directDL rejected lien_id={lien_id}: {exc}")
-                    if not raw_url:
-                        results.append({"status": "failed", "reason": "directdl_invalid_no_raw_url", "lien_id": lien_id, "error": str(exc)})
+            try:
+                source = self.hydra.get_lien(lien_id, streaming=False)
+                direct_url = extract_direct_dl_url(source)
+                raw_url = extract_raw_url(source)
+                downloaded: Path | None = None
+                if direct_url:
+                    self._log(f"download lien_id={lien_id} via directDL")
+                    try:
+                        downloaded = DirectDownloadClient(
+                            self.hydra.config.user_agent,
+                            insecure_tls=self.hydra.config.insecure_tls,
+                            logger=self.logger,
+                        ).download(direct_url, self.download_dir)
+                    except DownloadError as exc:
+                        self._log(f"directDL rejected lien_id={lien_id}: {exc}")
+                        if not raw_url:
+                            results.append({"status": "failed", "reason": "directdl_invalid_no_raw_url", "lien_id": lien_id, "error": str(exc)})
+                            continue
+                if downloaded is None and raw_url:
+                    self._log(f"download lien_id={lien_id} via 1fichier API raw_url")
+                    if not self.onefichier:
+                        results.append({"status": "failed", "reason": "missing_1fichier_token", "lien_id": lien_id})
                         continue
-            if downloaded is None and raw_url:
-                self._log(f"download lien_id={lien_id} via 1fichier API raw_url")
-                if not self.onefichier:
-                    results.append({"status": "failed", "reason": "missing_1fichier_token", "lien_id": lien_id})
+                    downloaded = self.onefichier.download(raw_url, self.download_dir, password=str(lien.get("password") or ""))
+                if downloaded is None:
+                    results.append({"status": "failed", "reason": "no_directdl_or_raw_url_from_api", "lien_id": lien_id, "source": source})
                     continue
-                downloaded = self.onefichier.download(raw_url, self.download_dir, password=str(lien.get("password") or ""))
-            if downloaded is None:
-                results.append({"status": "failed", "reason": "no_directdl_or_raw_url_from_api", "lien_id": lien_id, "source": source})
-                continue
-            self._log(f"build NZB lien_id={lien_id}")
-            nzb_path = self._build_nzb(downloaded, lien_id)
-            self._log(f"upload NZB lien_id={lien_id} path={nzb_path}")
-            created = self.hydra.create_nzb(
-                title_id=title_id,
-                qualite=qualite,
-                langues=langues,
-                lien_id=lien_id,
-                nzb_path=str(nzb_path),
-                subs=infer_subs(lien),
-                password=str(lien.get("password") or ""),
-                full_saison=bool(lien.get("full_saison")),
-                saison=parse_optional_int(lien.get("saison")),
-                episode=parse_optional_int(lien.get("episode")),
-            )
-            existing_lien_ids.add(lien_id)
-            results.append({
-                "status": "uploaded",
-                "lien_id": lien_id,
-                "downloaded": str(downloaded),
-                "nzb_path": str(nzb_path),
-                "created": created,
-            })
+                self._log(f"build NZB lien_id={lien_id}")
+                nzb_path = self._build_nzb(downloaded, lien_id)
+                self._log(f"upload NZB lien_id={lien_id} path={nzb_path}")
+                created = self.hydra.create_nzb(
+                    title_id=title_id,
+                    qualite=qualite,
+                    langues=langues,
+                    lien_id=lien_id,
+                    nzb_path=str(nzb_path),
+                    subs=infer_subs(lien),
+                    password=str(lien.get("password") or ""),
+                    full_saison=bool(lien.get("full_saison")),
+                    saison=parse_optional_int(lien.get("saison")),
+                    episode=parse_optional_int(lien.get("episode")),
+                )
+                existing_lien_ids.add(lien_id)
+                results.append({
+                    "status": "uploaded",
+                    "lien_id": lien_id,
+                    "downloaded": str(downloaded),
+                    "nzb_path": str(nzb_path),
+                    "created": created,
+                })
+            except Exception as exc:
+                self._log(f"failed lien_id={lien_id}: {type(exc).__name__}: {exc}")
+                results.append({
+                    "status": "failed",
+                    "reason": "exception",
+                    "lien_id": lien_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                })
         return {"title_id": title_id, "count": len(liens), "results": results}
 
     def _build_nzb(self, downloaded: Path, lien_id: str) -> Path:
