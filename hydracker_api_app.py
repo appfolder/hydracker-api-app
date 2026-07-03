@@ -17,6 +17,7 @@ import platform
 import re
 import secrets
 import shlex
+import shutil
 import ssl
 import subprocess
 import sys
@@ -85,6 +86,15 @@ class NyuuConfig:
     connections: int = 3
     from_: str = ""
     nzb_password: str = ""
+
+
+@dataclass
+class PackConfig:
+    enabled: bool = True
+    rar_bin: str = "rar"
+    par2_bin: str = "par2"
+    volume_size: str = "500m"
+    par2_redundancy: int = 10
 
 
 class HydrackerApiClient:
@@ -475,6 +485,7 @@ class LinkToNzbWorkflow:
         fallback_qualite: int | None = None,
         fallback_langues: list[str] | None = None,
         cleanup_downloads: bool = True,
+        pack: PackConfig | None = None,
         logger: Logger | None = None,
     ):
         self.hydra = hydra
@@ -487,6 +498,7 @@ class LinkToNzbWorkflow:
         self.fallback_qualite = fallback_qualite
         self.fallback_langues = fallback_langues or []
         self.cleanup_downloads = cleanup_downloads
+        self.pack = pack or PackConfig()
         self.logger = logger
 
     def sync_title(self, title_ref: str, *, query: str | None = None, limit: int | None = None) -> dict[str, Any]:
@@ -681,7 +693,7 @@ class LinkToNzbWorkflow:
                             insecure_tls=self.hydra.config.insecure_tls,
                             logger=self.logger,
                         ).download(direct_url, self.download_dir, expected_size=expected_size)
-                    except DownloadError as exc:
+                    except (DownloadError, HTTPError, URLError, TimeoutError) as exc:
                         self._log(f"directDL rejected lien_id={lien_id}: {exc}")
                         if not raw_url:
                             results.append({"status": "failed", "reason": "directdl_invalid_no_raw_url", "lien_id": lien_id, "error": str(exc)})
@@ -697,7 +709,7 @@ class LinkToNzbWorkflow:
                     continue
                 nzb_password = generate_nzb_password()
                 self._log(f"build NZB lien_id={lien_id}")
-                nzb_path = self._build_nzb(downloaded, lien_id, password=nzb_password)
+                nzb_path, cleanup_paths = self._build_nzb(downloaded, lien_id, password=nzb_password)
                 self._log(f"upload NZB lien_id={lien_id} path={nzb_path}")
                 created = self.hydra.create_nzb(
                     title_id=title_id,
@@ -713,7 +725,7 @@ class LinkToNzbWorkflow:
                 )
                 existing_lien_ids.add(lien_id)
                 if self.cleanup_downloads:
-                    self._cleanup_download(downloaded)
+                    self._cleanup_paths([downloaded, *cleanup_paths])
                 results.append({
                     "status": "uploaded",
                     "lien_id": lien_id,
@@ -732,28 +744,40 @@ class LinkToNzbWorkflow:
                 })
         return {"title_id": title_id, "count": len(liens), "results": results}
 
-    def _cleanup_download(self, downloaded: Path) -> None:
-        try:
-            root = self.download_dir.resolve()
-            target = downloaded.resolve()
-            if root == target or root not in target.parents:
-                self._log(f"cleanup skipped outside download dir: {downloaded}")
-                return
-            target.unlink(missing_ok=True)
-            self._log(f"cleanup deleted downloaded file {downloaded}")
-        except Exception as exc:
-            self._log(f"cleanup failed for {downloaded}: {type(exc).__name__}: {exc}")
+    def _cleanup_paths(self, paths: list[Path]) -> None:
+        roots = [self.download_dir.resolve()]
+        if self.nzb_dir:
+            roots.append(self.nzb_dir.resolve())
+        for path in paths:
+            try:
+                target = path.resolve()
+                if all(root != target and root not in target.parents for root in roots):
+                    self._log(f"cleanup skipped outside managed dirs: {path}")
+                    continue
+                if target.is_dir():
+                    shutil.rmtree(target)
+                    self._log(f"cleanup deleted directory {path}")
+                else:
+                    target.unlink(missing_ok=True)
+                    self._log(f"cleanup deleted file {path}")
+            except Exception as exc:
+                self._log(f"cleanup failed for {path}: {type(exc).__name__}: {exc}")
 
-    def _build_nzb(self, downloaded: Path, lien_id: str, *, password: str = "") -> Path:
+    def _build_nzb(self, downloaded: Path, lien_id: str, *, password: str = "") -> tuple[Path, list[Path]]:
+        payload_path = downloaded
+        cleanup_paths: list[Path] = []
+        if self.pack.enabled:
+            payload_path = self._build_archive_pack(downloaded, lien_id, password=password)
+            cleanup_paths.append(payload_path)
         if self.nyuu.enabled:
             output_dir = self.nzb_dir or downloaded.parent
             output_dir.mkdir(parents=True, exist_ok=True)
             nzb_path = unique_path(output_dir / f"{downloaded.stem}.nzb")
             config = dataclasses_replace(self.nyuu, nzb_password=password)
-            config_path = write_nyuu_config(config, downloaded, nzb_path)
+            config_path = write_nyuu_config(config, downloaded, nzb_path, title=downloaded.stem)
             try:
-                command = build_nyuu_command(self.nyuu, downloaded, config_path)
-                self._log(f"Nyuu posting {downloaded.name}")
+                command = build_nyuu_command(self.nyuu, [payload_path], config_path)
+                self._log(f"Nyuu posting {payload_path.name}")
                 completed = subprocess.run(command, check=True, capture_output=True, text=True)
                 if completed.stdout:
                     self._log(f"Nyuu stdout: {completed.stdout[-2000:]}")
@@ -768,7 +792,7 @@ class LinkToNzbWorkflow:
             finally:
                 Path(config_path).unlink(missing_ok=True)
             if nzb_path.exists():
-                return nzb_path
+                return nzb_path, cleanup_paths
             raise RuntimeError(f"Nyuu completed but did not create {nzb_path}")
 
         if self.poster_command:
@@ -776,7 +800,7 @@ class LinkToNzbWorkflow:
             output_dir.mkdir(parents=True, exist_ok=True)
             before = set(output_dir.glob("*.nzb"))
             command = self.poster_command.format(
-                input=shlex.quote(str(downloaded)),
+                input=shlex.quote(str(payload_path)),
                 output_dir=shlex.quote(str(output_dir)),
                 lien_id=shlex.quote(lien_id),
             )
@@ -784,7 +808,7 @@ class LinkToNzbWorkflow:
             after = set(output_dir.glob("*.nzb"))
             created = sorted(after - before, key=lambda p: p.stat().st_mtime, reverse=True)
             if created:
-                return created[0]
+                return created[0], cleanup_paths
 
         if self.nzb_dir:
             candidates = sorted(
@@ -793,9 +817,52 @@ class LinkToNzbWorkflow:
                 reverse=True,
             )
             if candidates:
-                return candidates[0]
+                return candidates[0], cleanup_paths
 
         raise RuntimeError("No NZB was produced. Configure --poster-command or --nzb-dir.")
+
+    def _build_archive_pack(self, downloaded: Path, lien_id: str, *, password: str) -> Path:
+        if not password:
+            raise RuntimeError("RAR packaging requires an NZB password.")
+        pack_root = self.download_dir / "_usenet_packs"
+        pack_root.mkdir(parents=True, exist_ok=True)
+        pack_dir = unique_path(pack_root / f"{downloaded.stem}-{lien_id}")
+        pack_dir.mkdir(parents=True, exist_ok=False)
+        archive_base = pack_dir / f"{downloaded.stem}.rar"
+        volume_size = self.pack.volume_size.strip() or "500m"
+        redundancy = max(1, min(100, int(self.pack.par2_redundancy or 10)))
+
+        rar_command = [
+            self.pack.rar_bin,
+            "a",
+            "-idq",
+            "-m0",
+            "-ep",
+            f"-v{volume_size}",
+            f"-hp{password}",
+            str(archive_base),
+            str(downloaded),
+        ]
+        self._log(f"RAR packing {downloaded.name} volume={volume_size}")
+        subprocess.run(rar_command, check=True, capture_output=True, text=True)
+
+        rar_files = sorted(
+            path for path in pack_dir.iterdir()
+            if path.is_file() and re.search(r"(\.part\d+\.rar|\.rar|\.r\d{2,3})$", path.name, re.IGNORECASE)
+        )
+        if not rar_files:
+            raise RuntimeError(f"RAR completed but produced no archive files in {pack_dir}")
+
+        par2_base = pack_dir / f"{downloaded.stem}.par2"
+        par2_command = build_par2_command(self.pack.par2_bin, par2_base, rar_files, redundancy)
+        self._log(f"PAR2 creating recovery={redundancy}% files={len(rar_files)}")
+        subprocess.run(par2_command, check=True, capture_output=True, text=True)
+
+        pack_files = sorted(path for path in pack_dir.iterdir() if path.is_file())
+        if not any(path.suffix.lower() == ".par2" for path in pack_files):
+            raise RuntimeError(f"PAR2 completed but produced no .par2 files in {pack_dir}")
+        self._log(f"archive pack ready {pack_dir} files={len(pack_files)}")
+        return pack_dir
 
     def _log(self, message: str) -> None:
         if self.logger:
@@ -1129,7 +1196,7 @@ def unique_path(path: Path) -> Path:
     raise RuntimeError(f"Cannot find a free filename for {path}")
 
 
-def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path) -> str:
+def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path, *, title: str | None = None) -> str:
     host = config.host.strip()
     user = config.user.strip()
     password = config.password.strip()
@@ -1153,7 +1220,7 @@ def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path) -> s
         "groups": groups,
         "out": str(nzb_path),
         "overwrite": True,
-        "nzb-title": input_path.stem,
+        "nzb-title": title or input_path.stem,
     }
     if config.port:
         data["port"] = config.port
@@ -1167,10 +1234,20 @@ def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path) -> s
         return fh.name
 
 
-def build_nyuu_command(config: NyuuConfig, input_path: Path, config_path: str) -> list[str]:
+def build_nyuu_command(config: NyuuConfig, input_paths: list[Path], config_path: str) -> list[str]:
     command = shlex.split(config.bin)
     command.extend(["--config", config_path])
-    command.append(str(input_path))
+    command.extend(str(input_path) for input_path in input_paths)
+    return command
+
+
+def build_par2_command(par2_bin: str, output_base: Path, input_paths: list[Path], redundancy: int) -> list[str]:
+    binary_name = Path(shlex.split(par2_bin)[0]).name.lower()
+    command = shlex.split(par2_bin)
+    if "par2create" not in binary_name:
+        command.append("create")
+    command.extend(["-q", f"-r{redundancy}", str(output_base)])
+    command.extend(str(path) for path in input_paths)
     return command
 
 
@@ -1284,6 +1361,11 @@ def add_workflow_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--usenet-from", default=os.getenv("HYDRA_USENET_FROM", ""))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-downloads", action="store_true", help="Do not delete downloaded files after a successful Hydracker NZB upload.")
+    parser.add_argument("--no-pack-archives", action="store_true", help="Post the downloaded file directly instead of RAR/PAR2 packaging.")
+    parser.add_argument("--rar-bin", default=os.getenv("RAR_BIN", "rar"))
+    parser.add_argument("--par2-bin", default=os.getenv("PAR2_BIN", "par2"))
+    parser.add_argument("--rar-volume-size", default=os.getenv("RAR_VOLUME_SIZE", "500m"))
+    parser.add_argument("--par2-redundancy", type=int, default=parse_optional_int(os.getenv("PAR2_REDUNDANCY", "")) or 10)
     parser.add_argument("--qualite", type=int, help="Fallback quality ID when the link metadata has no quality.")
     parser.add_argument("--langues", default="", help="Fallback comma-separated languages, e.g. TrueFrench,English.")
 
@@ -1315,6 +1397,13 @@ def workflow_from_args(args: argparse.Namespace) -> LinkToNzbWorkflow:
         fallback_qualite=args.qualite,
         fallback_langues=split_csv(args.langues),
         cleanup_downloads=not args.keep_downloads,
+        pack=PackConfig(
+            enabled=not args.no_pack_archives,
+            rar_bin=args.rar_bin,
+            par2_bin=args.par2_bin,
+            volume_size=args.rar_volume_size,
+            par2_redundancy=args.par2_redundancy,
+        ),
         logger=print,
     )
 
@@ -1454,6 +1543,11 @@ def launch_gui(force: bool = False) -> int:
     usenet_groups = tk.StringVar(value=setting_value(settings, "usenet_groups", os.getenv("HYDRA_USENET_GROUPS", "alt.binaries.multimedia")))
     usenet_connections = tk.StringVar(value=setting_value(settings, "usenet_connections", os.getenv("HYDRA_USENET_CONNECTIONS", "3")))
     usenet_from = tk.StringVar(value=setting_value(settings, "usenet_from", os.getenv("HYDRA_USENET_FROM", "")))
+    pack_archives = tk.BooleanVar(value=bool(settings.get("pack_archives", True)))
+    rar_bin = tk.StringVar(value=setting_value(settings, "rar_bin", os.getenv("RAR_BIN", "rar")))
+    par2_bin = tk.StringVar(value=setting_value(settings, "par2_bin", os.getenv("PAR2_BIN", "par2")))
+    rar_volume_size = tk.StringVar(value=setting_value(settings, "rar_volume_size", os.getenv("RAR_VOLUME_SIZE", "500m")))
+    par2_redundancy = tk.StringVar(value=setting_value(settings, "par2_redundancy", os.getenv("PAR2_REDUNDANCY", "10")))
     dry_run = tk.BooleanVar(value=bool(settings.get("dry_run", True)))
     status = tk.StringVar(value="Ready")
 
@@ -1855,6 +1949,11 @@ def launch_gui(force: bool = False) -> int:
     row(nyuu_box, "Connections", usenet_connections, 7)
     row(nyuu_box, "From", usenet_from, 8)
     row(nyuu_box, "Custom command", poster_command, 9)
+    ttk.Checkbutton(nyuu_box, text="RAR/PAR2 packaging", variable=pack_archives).grid(row=10, column=1, sticky="w", pady=4)
+    row(nyuu_box, "RAR bin", rar_bin, 11)
+    row(nyuu_box, "PAR2 bin", par2_bin, 12)
+    row(nyuu_box, "RAR volume", rar_volume_size, 13)
+    row(nyuu_box, "PAR2 recovery %", par2_redundancy, 14)
 
     options_actions = ttk.Frame(options)
     options_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
@@ -1897,6 +1996,13 @@ def launch_gui(force: bool = False) -> int:
                 from_=usenet_from.get().strip(),
             ),
             dry_run=dry_run.get(),
+            pack=PackConfig(
+                enabled=pack_archives.get(),
+                rar_bin=rar_bin.get().strip() or "rar",
+                par2_bin=par2_bin.get().strip() or "par2",
+                volume_size=rar_volume_size.get().strip() or "500m",
+                par2_redundancy=parse_optional_int(par2_redundancy.get().strip()) or 10,
+            ),
             logger=append_log,
         )
 
@@ -1930,6 +2036,11 @@ def launch_gui(force: bool = False) -> int:
             "usenet_groups": usenet_groups.get(),
             "usenet_connections": usenet_connections.get(),
             "usenet_from": usenet_from.get(),
+            "pack_archives": pack_archives.get(),
+            "rar_bin": rar_bin.get(),
+            "par2_bin": par2_bin.get(),
+            "rar_volume_size": rar_volume_size.get(),
+            "par2_redundancy": par2_redundancy.get(),
             "dry_run": dry_run.get(),
         }
 
