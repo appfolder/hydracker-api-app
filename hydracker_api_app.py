@@ -98,6 +98,7 @@ class HydrackerApiClient:
         title_id: int,
         *,
         host: int | None = ONEFICHIER_HOST_ID,
+        lien_id: str | int | None = None,
         page: int = 1,
         per_page: int = 100,
         query: str | None = None,
@@ -105,6 +106,8 @@ class HydrackerApiClient:
         params: dict[str, Any] = {"page": page, "perPage": per_page}
         if host is not None:
             params["host"] = host
+        if lien_id:
+            params["lien_id"] = lien_id
         if query:
             params["query"] = query
         return self._request("GET", f"/titles/{title_id}/content/liens?{urlencode(params)}")
@@ -114,13 +117,14 @@ class HydrackerApiClient:
         title_id: int,
         *,
         host: int | None = ONEFICHIER_HOST_ID,
+        lien_id: str | int | None = None,
         query: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         page = 1
         liens: list[dict[str, Any]] = []
         while True:
-            data = self.list_title_liens(title_id, host=host, page=page, per_page=100, query=query)
+            data = self.list_title_liens(title_id, host=host, lien_id=lien_id, page=page, per_page=100, query=query)
             batch = extract_items(data, ("liens", "data"))
             if not batch:
                 break
@@ -132,14 +136,17 @@ class HydrackerApiClient:
             page += 1
         return liens
 
-    def list_title_nzbs(self, title_id: int, *, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-        return self._request("GET", f"/titles/{title_id}/content/nzbs?{urlencode({'page': page, 'perPage': per_page})}")
+    def list_title_nzbs(self, title_id: int, *, page: int = 1, per_page: int = 100, lien_id: str | int | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"page": page, "perPage": per_page}
+        if lien_id:
+            params["lien_id"] = lien_id
+        return self._request("GET", f"/titles/{title_id}/content/nzbs?{urlencode(params)}")
 
-    def list_all_title_nzbs(self, title_id: int) -> list[dict[str, Any]]:
+    def list_all_title_nzbs(self, title_id: int, *, lien_id: str | int | None = None) -> list[dict[str, Any]]:
         page = 1
         nzbs: list[dict[str, Any]] = []
         while True:
-            data = self.list_title_nzbs(title_id, page=page, per_page=100)
+            data = self.list_title_nzbs(title_id, page=page, per_page=100, lien_id=lien_id)
             batch = extract_items(data, ("nzbs", "data"))
             if not batch:
                 break
@@ -499,16 +506,25 @@ class LinkToNzbWorkflow:
         if not title_id:
             raise ValueError(f"Cannot resolve title_id for lien_id={lien_id}")
 
-        liens = self.hydra.list_all_title_liens(title_id, host=ONEFICHIER_HOST_ID)
+        existing_nzbs = self.hydra.list_all_title_nzbs(title_id, lien_id=lien_id)
+        existing_lien_ids = {
+            str(nzb["lien_id"])
+            for nzb in existing_nzbs
+            if isinstance(nzb, dict) and nzb.get("lien_id")
+        }
+        if lien_id in existing_lien_ids:
+            self._log(f"skip lien_id={lien_id}: NZB already exists")
+            return {
+                "title_id": title_id,
+                "count": 1,
+                "results": [{"status": "skipped", "reason": "nzb_already_exists_for_lien_id", "lien_id": lien_id}],
+            }
+
+        liens = self.hydra.list_all_title_liens(title_id, host=ONEFICHIER_HOST_ID, lien_id=lien_id, limit=1)
         lien = next((item for item in liens if str(item.get("id") or item.get("lien_id") or "") == lien_id), None)
         if lien is None:
             lien = dict(source_lien)
         lien["_source_response"] = source
-        existing_lien_ids = {
-            str(nzb["lien_id"])
-            for nzb in self.hydra.list_all_title_nzbs(title_id)
-            if isinstance(nzb, dict) and nzb.get("lien_id")
-        }
         return self._sync_liens(title_id, [lien], existing_lien_ids)
 
     def sync_category(
