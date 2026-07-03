@@ -710,6 +710,8 @@ class LinkToNzbWorkflow:
                 nzb_password = generate_nzb_password()
                 self._log(f"build NZB lien_id={lien_id}")
                 nzb_path, cleanup_paths = self._build_nzb(downloaded, lien_id, password=nzb_password)
+                if self.cleanup_downloads:
+                    self._cleanup_paths([downloaded, *cleanup_paths])
                 self._log(f"upload NZB lien_id={lien_id} path={nzb_path}")
                 created = self.hydra.create_nzb(
                     title_id=title_id,
@@ -724,8 +726,6 @@ class LinkToNzbWorkflow:
                     episode=parse_optional_int(lien.get("episode")),
                 )
                 existing_lien_ids.add(lien_id)
-                if self.cleanup_downloads:
-                    self._cleanup_paths([downloaded, *cleanup_paths])
                 results.append({
                     "status": "uploaded",
                     "lien_id": lien_id,
