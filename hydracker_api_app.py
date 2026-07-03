@@ -1160,7 +1160,7 @@ def write_nyuu_config(config: NyuuConfig, input_path: Path, nzb_path: Path) -> s
     if config.from_:
         data["from"] = config.from_
     if config.nzb_password:
-        data["nzb-password"] = config.nzb_password
+        data["nzb-password"] = [config.nzb_password]
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".nyuu.json", delete=False) as fh:
         json.dump(data, fh)
         fh.write("\n")
