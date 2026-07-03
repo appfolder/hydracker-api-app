@@ -333,8 +333,9 @@ class OneFichierClient:
         self.logger = logger
 
     def get_download_token(self, url: str, password: str = "") -> dict[str, Any]:
+        url = normalize_onefichier_url(url)
         self._log(f"1fichier token request for {url}")
-        payload: dict[str, Any] = {"url": url}
+        payload: dict[str, Any] = {"url": url, "pretty": 1}
         if password:
             payload["pass"] = password
         return self._post("/download/get_token.cgi", payload)
@@ -818,6 +819,16 @@ def parse_channel_id(value: str) -> int:
 
 def extract_lien_url(data: dict[str, Any]) -> str:
     return extract_raw_url(data) or extract_direct_dl_url(data)
+
+
+def normalize_onefichier_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "1fichier.com" not in parsed.netloc.lower() or not parsed.query:
+        return url
+    file_code = parsed.query.split("&", 1)[0]
+    if not file_code:
+        return url
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}/?{file_code}"
 
 
 def extract_direct_dl_url(data: dict[str, Any]) -> str:
