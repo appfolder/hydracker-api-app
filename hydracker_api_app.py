@@ -340,7 +340,7 @@ class OneFichierClient:
             payload["pass"] = password
         return self._post("/download/get_token.cgi", payload)
 
-    def download(self, url: str, dest_dir: Path, *, password: str = "", filename: str | None = None) -> Path:
+    def download(self, url: str, dest_dir: Path, *, password: str = "", filename: str | None = None, expected_size: int | None = None) -> Path:
         token_data = self.get_download_token(url, password=password)
         download_url = find_first_url(token_data)
         if not download_url:
@@ -351,7 +351,12 @@ class OneFichierClient:
         context = ssl._create_unverified_context() if self.config.insecure_tls else None
         with urlopen(req, timeout=3600, context=context) as resp:
             target_name = filename or filename_from_response(resp.headers.get("Content-Disposition"), download_url)
-            target = unique_path(dest_dir / sanitize_filename(target_name))
+            target = dest_dir / sanitize_filename(target_name)
+            reusable = reusable_existing_file(target, expected_size, response_content_length(resp.headers.get("Content-Length")))
+            if reusable:
+                self._log(f"1fichier reusing existing file {reusable}")
+                return reusable
+            target = unique_path(target)
             self._log(f"1fichier downloading to {target}")
             with target.open("wb") as fh:
                 total = 0
@@ -405,18 +410,23 @@ class DirectDownloadClient:
         self.insecure_tls = insecure_tls
         self.logger = logger
 
-    def download(self, url: str, dest_dir: Path, *, filename: str | None = None) -> Path:
+    def download(self, url: str, dest_dir: Path, *, filename: str | None = None, expected_size: int | None = None) -> Path:
         dest_dir.mkdir(parents=True, exist_ok=True)
         req = Request(url, headers={"User-Agent": self.user_agent})
         context = ssl._create_unverified_context() if self.insecure_tls else None
         self._log("directDL download started")
         with urlopen(req, timeout=3600, context=context) as resp:
             content_type = (resp.headers.get("Content-Type") or "").lower()
+            target_name = filename or filename_from_response(resp.headers.get("Content-Disposition"), url)
+            target = dest_dir / sanitize_filename(target_name)
+            reusable = reusable_existing_file(target, expected_size, response_content_length(resp.headers.get("Content-Length")))
+            if reusable:
+                self._log(f"directDL reusing existing file {reusable}")
+                return reusable
             first_chunk = resp.read(1024 * 1024)
             if looks_like_html(first_chunk, content_type):
                 raise DownloadError(f"directDL returned HTML instead of a file: content-type={content_type or 'unknown'}")
-            target_name = filename or filename_from_response(resp.headers.get("Content-Disposition"), url)
-            target = unique_path(dest_dir / sanitize_filename(target_name))
+            target = unique_path(target)
             with target.open("wb") as fh:
                 fh.write(first_chunk)
                 total = len(first_chunk)
@@ -563,6 +573,7 @@ class LinkToNzbWorkflow:
                 source = lien.get("_source_response") if isinstance(lien.get("_source_response"), dict) else self.hydra.get_lien(lien_id, streaming=False)
                 direct_url = extract_direct_dl_url(source)
                 raw_url = extract_raw_url(source)
+                expected_size = parse_optional_int(lien.get("taille") or source.get("taille") or (source.get("lien") or {}).get("taille"))
                 downloaded: Path | None = None
                 if direct_url:
                     self._log(f"download lien_id={lien_id} via directDL")
@@ -571,7 +582,7 @@ class LinkToNzbWorkflow:
                             self.hydra.config.user_agent,
                             insecure_tls=self.hydra.config.insecure_tls,
                             logger=self.logger,
-                        ).download(direct_url, self.download_dir)
+                        ).download(direct_url, self.download_dir, expected_size=expected_size)
                     except DownloadError as exc:
                         self._log(f"directDL rejected lien_id={lien_id}: {exc}")
                         if not raw_url:
@@ -582,7 +593,7 @@ class LinkToNzbWorkflow:
                     if not self.onefichier:
                         results.append({"status": "failed", "reason": "missing_1fichier_token", "lien_id": lien_id})
                         continue
-                    downloaded = self.onefichier.download(raw_url, self.download_dir, password=str(lien.get("password") or ""))
+                    downloaded = self.onefichier.download(raw_url, self.download_dir, password=str(lien.get("password") or ""), expected_size=expected_size)
                 if downloaded is None:
                     results.append({"status": "failed", "reason": "no_directdl_or_raw_url_from_api", "lien_id": lien_id, "source": source})
                     continue
@@ -953,6 +964,26 @@ def filename_from_response(content_disposition: str | None, url: str) -> str:
     parsed = urlparse(url)
     name = Path(unquote(parsed.path)).name
     return name or f"download-{int(time.time())}.bin"
+
+
+def response_content_length(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def reusable_existing_file(path: Path, expected_size: int | None = None, response_size: int | None = None) -> Path | None:
+    if not path.exists() or not path.is_file():
+        return None
+    actual_size = path.stat().st_size
+    for size in (expected_size, response_size):
+        if size and actual_size == size:
+            return path
+    return None
 
 
 def looks_like_html(chunk: bytes, content_type: str = "") -> bool:
