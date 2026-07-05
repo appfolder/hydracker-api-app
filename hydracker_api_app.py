@@ -1320,6 +1320,13 @@ def build_parser() -> argparse.ArgumentParser:
     sync_lien.add_argument("id", help="Hydracker direct-link ID.")
     add_workflow_args(sync_lien)
 
+    sync_liens_file = sub.add_parser("sync-liens-file", help="Run sync-lien for newline-separated lien IDs from a file.")
+    sync_liens_file.add_argument("file", help="Path to a newline-separated lien_id queue.")
+    add_workflow_args(sync_liens_file)
+    sync_liens_file.add_argument("--done-file", help="Append processed lien IDs here and skip them on resume.")
+    sync_liens_file.add_argument("--sleep", type=float, default=1.0, help="Seconds to wait between lien IDs.")
+    sync_liens_file.add_argument("--limit", type=int, help="Maximum number of pending IDs to process.")
+
     sync_category = sub.add_parser("sync-category", help="Run sync-title for titles from a category/filter.")
     add_workflow_args(sync_category)
     sync_category.add_argument("--genre")
@@ -1408,6 +1415,80 @@ def workflow_from_args(args: argparse.Namespace) -> LinkToNzbWorkflow:
     )
 
 
+def read_lien_id_file(path: Path) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lien_id = line.split()[0].strip()
+        if not lien_id or lien_id in seen:
+            continue
+        seen.add(lien_id)
+        ids.append(lien_id)
+    return ids
+
+
+def run_sync_liens_file(args: argparse.Namespace) -> int:
+    queue_path = Path(args.file)
+    done_path = Path(args.done_file) if args.done_file else queue_path.with_suffix(queue_path.suffix + ".done")
+    all_ids = read_lien_id_file(queue_path)
+    done_ids = set(read_lien_id_file(done_path)) if done_path.exists() else set()
+    pending_ids = [lien_id for lien_id in all_ids if lien_id not in done_ids]
+    if args.limit:
+        pending_ids = pending_ids[:args.limit]
+
+    workflow = workflow_from_args(args)
+    done_path.parent.mkdir(parents=True, exist_ok=True)
+    processed = 0
+    uploaded = 0
+    skipped = 0
+    failed = 0
+
+    with done_path.open("a", encoding="utf-8") as done_fh:
+        for lien_id in pending_ids:
+            status = "failed"
+            payload: dict[str, Any]
+            try:
+                result = workflow.sync_lien(lien_id)
+                item_statuses = [
+                    str(item.get("status"))
+                    for item in result.get("results", [])
+                    if isinstance(item, dict) and item.get("status")
+                ]
+                status = item_statuses[0] if item_statuses else "unknown"
+                payload = {"lien_id": lien_id, "status": status, "result": result}
+            except Exception as exc:
+                payload = {"lien_id": lien_id, "status": "failed", "error_type": type(exc).__name__, "error": str(exc)}
+
+            processed += 1
+            if status == "uploaded":
+                uploaded += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+            done_fh.write(f"{lien_id}\n")
+            done_fh.flush()
+            if args.sleep > 0:
+                time.sleep(args.sleep)
+
+    print(pretty({
+        "queue": str(queue_path),
+        "done_file": str(done_path),
+        "total_ids": len(all_ids),
+        "already_done": len(done_ids),
+        "processed": processed,
+        "uploaded": uploaded,
+        "skipped": skipped,
+        "failed": failed,
+    }), end="")
+    return 0
+
+
 def cli(argv: list[str]) -> int:
     parser = build_parser()
     if not argv:
@@ -1473,6 +1554,8 @@ def cli(argv: list[str]) -> int:
     if args.command == "sync-lien":
         print(pretty(workflow_from_args(args).sync_lien(args.id)), end="")
         return 0
+    if args.command == "sync-liens-file":
+        return run_sync_liens_file(args)
     if args.command == "sync-category":
         print(pretty(workflow_from_args(args).sync_category(
             genre=args.genre,
