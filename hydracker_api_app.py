@@ -2131,8 +2131,17 @@ def launch_gui(force: bool = False) -> int:
         save_settings(collect_settings())
         return {"saved": str(SETTINGS_PATH)}
 
-    def run_async(label: str, fn) -> None:
+    sync_lock = threading.Lock()
+
+    def run_async(label: str, fn, *, exclusive: bool = False) -> None:
         def worker() -> None:
+            locked = False
+            if exclusive:
+                locked = sync_lock.acquire(blocking=False)
+                if not locked:
+                    append_log(f"skip {label}: another sync is already running")
+                    root.after(0, lambda: show_message("Un upload est deja en cours. Attendez la fin du title en cours."))
+                    return
             root.after(0, lambda: (status.set(f"Running {label}"), progress.start(10), show_message(f"Chargement: {label}")))
             append_log(f"start {label}")
             try:
@@ -2145,6 +2154,8 @@ def launch_gui(force: bool = False) -> int:
             finally:
                 append_log(f"done {label}")
                 root.after(0, lambda: (progress.stop(), status.set("Ready")))
+                if locked:
+                    sync_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2252,11 +2263,14 @@ def launch_gui(force: bool = False) -> int:
             if not tid:
                 results.append({"status": "skipped", "reason": "missing_title_id", "title": title})
                 continue
-            append_log(f"sync channel title {index}/{len(titles)} title_id={tid}")
+            append_log(f"sync channel title {index}/{len(titles)} title_id={tid} start")
             try:
-                results.append(workflow.sync_title(str(tid)))
+                result = workflow.sync_title(str(tid))
+                results.append(result)
+                append_log(f"sync channel title {index}/{len(titles)} title_id={tid} done")
             except Exception as exc:
                 results.append({"title_id": tid, "error": f"{type(exc).__name__}: {exc}"})
+                append_log(f"sync channel title {index}/{len(titles)} title_id={tid} failed: {type(exc).__name__}: {exc}")
         return {"channel": channel_ref.get(), "page": channel_page.get(), "titles": len(titles), "results": results}
 
     def do_sync_selected() -> dict[str, Any]:
@@ -2344,7 +2358,7 @@ def launch_gui(force: bool = False) -> int:
         log_text.delete("1.0", tk.END)
 
     ttk.Button(action_box, text="Run", command=lambda: run_async(f"run-{mode.get()}", do_run_selected)).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(action_box, text="Download + NZB + Upload", command=lambda: run_async(f"sync-{mode.get()}", do_sync_selected)).pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Button(action_box, text="Download + NZB + Upload", command=lambda: run_async(f"sync-{mode.get()}", do_sync_selected, exclusive=True)).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Button(action_box, text="Clear result", command=clear_results).pack(side=tk.LEFT, padx=(0, 8))
     ttk.Button(options_actions, text="Save options", command=lambda: run_async("save-options", do_save_settings)).pack(side=tk.LEFT)
     ttk.Button(logs_tab, text="Clear logs", command=clear_logs).grid(row=1, column=0, sticky="w", pady=(8, 0))
