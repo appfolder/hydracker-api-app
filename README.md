@@ -89,6 +89,29 @@ python3 hydracker_api_app.py sync-category \
   --dry-run
 ```
 
+Workflow séries title par title:
+
+```bash
+python3 hydracker_api_app.py --base-url https://hydracker.com/api/v1 sync-random-series \
+  --titles 1000 \
+  --limit 500 \
+  --poster nyuu \
+  --download-dir downloads/series-job \
+  --nzb-dir nzbs/series-job
+```
+
+Cette commande appelle l'endpoint privé Hydracker qui choisit une série
+aléatoire avec des liens 1Fichier sans NZB. L'app finit tous les `lien_id` du
+title reçu avant de demander une autre série.
+
+Pour tester un title précis:
+
+```bash
+python3 hydracker_api_app.py --base-url https://hydracker.com/api/v1 sync-random-series \
+  --title-id 133530 \
+  --dry-run
+```
+
 ## GUI
 
 Sur un poste avec environnement graphique:

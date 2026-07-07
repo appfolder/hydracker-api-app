@@ -107,6 +107,17 @@ class HydrackerApiClient:
         query = "?streaming=1" if streaming else ""
         return self._request("GET", f"/content/liens/{ids}{query}")
 
+    def random_series_missing_nzb_liens(
+        self,
+        *,
+        limit: int = 500,
+        title_id: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if title_id:
+            params["title_id"] = title_id
+        return self._request("GET", f"/internal/nzb/random-series-missing-liens?{urlencode(params)}")
+
     def list_title_liens(
         self,
         title_id: int,
@@ -648,6 +659,64 @@ class LinkToNzbWorkflow:
         elif last_page_result is not None:
             payload["last_page"] = last_page_result
         return payload
+
+    def sync_random_series(
+        self,
+        *,
+        titles: int = 1,
+        limit: int = 500,
+        title_id: int | None = None,
+        sleep: float = 0.0,
+    ) -> dict[str, Any]:
+        titles = max(1, titles)
+        totals = {"titles": 0, "uploaded": 0, "skipped": 0, "failed": 0, "empty": 0}
+        results: list[dict[str, Any]] = []
+
+        for index in range(1, titles + 1):
+            payload = self.hydra.random_series_missing_nzb_liens(limit=limit, title_id=title_id)
+            title = payload.get("title") if isinstance(payload, dict) else None
+            current_title_id = parse_optional_int(title.get("id") if isinstance(title, dict) else None)
+            liens = payload.get("liens") if isinstance(payload, dict) else []
+            if not current_title_id or not isinstance(liens, list) or not liens:
+                self._log(f"sync-random-series {index}/{titles}: no missing liens")
+                totals["empty"] += 1
+                results.append({"status": "empty", "response": payload})
+                if title_id:
+                    break
+                if sleep > 0:
+                    time.sleep(sleep)
+                continue
+
+            title_name = title.get("name") if isinstance(title, dict) else ""
+            self._log(
+                f"sync-random-series {index}/{titles}: "
+                f"title_id={current_title_id} links={len(liens)} title={title_name!r}"
+            )
+            existing_lien_ids = {
+                str(nzb["lien_id"])
+                for nzb in self.hydra.list_all_title_nzbs(current_title_id)
+                if isinstance(nzb, dict) and nzb.get("lien_id")
+            }
+            result = self._sync_liens(current_title_id, liens, existing_lien_ids)
+            result["title"] = title
+            results.append(result)
+            totals["titles"] += 1
+
+            for item in result.get("results", []):
+                status = item.get("status") if isinstance(item, dict) else None
+                if status == "uploaded":
+                    totals["uploaded"] += 1
+                elif status == "skipped":
+                    totals["skipped"] += 1
+                elif status == "failed":
+                    totals["failed"] += 1
+
+            if title_id:
+                break
+            if sleep > 0 and index < titles:
+                time.sleep(sleep)
+
+        return {"totals": totals, "results": results}
 
     def _sync_liens(
         self,
@@ -1343,6 +1412,16 @@ def build_parser() -> argparse.ArgumentParser:
     sync_channel.add_argument("--limit-per-title", type=int)
     sync_channel.add_argument("--store-results", action="store_true", help="Keep full per-title results in memory and final JSON output.")
 
+    sync_random_series = sub.add_parser(
+        "sync-random-series",
+        help="Fetch a random series with missing NZBs from Hydracker, then finish all its lien IDs before another title.",
+    )
+    add_workflow_args(sync_random_series)
+    sync_random_series.add_argument("--titles", type=int, default=1, help="Number of random series titles to process.")
+    sync_random_series.add_argument("--limit", type=int, default=500, help="Maximum missing lien IDs returned per series.")
+    sync_random_series.add_argument("--title-id", type=int, help="Debug/process a specific title instead of random.")
+    sync_random_series.add_argument("--sleep", type=float, default=2.0, help="Seconds to wait between titles.")
+
     return parser
 
 
@@ -1572,6 +1651,14 @@ def cli(argv: list[str]) -> int:
             max_pages=args.max_pages,
             limit_per_title=args.limit_per_title,
             keep_results=args.store_results,
+        )), end="")
+        return 0
+    if args.command == "sync-random-series":
+        print(pretty(workflow_from_args(args).sync_random_series(
+            titles=args.titles,
+            limit=args.limit,
+            title_id=args.title_id,
+            sleep=args.sleep,
         )), end="")
         return 0
 
