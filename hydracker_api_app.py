@@ -749,6 +749,8 @@ class LinkToNzbWorkflow:
                 continue
 
             try:
+                if self.cleanup_downloads:
+                    self._cleanup_stale_download_artifacts()
                 source = lien.get("_source_response") if isinstance(lien.get("_source_response"), dict) else self.hydra.get_lien(lien_id, streaming=False)
                 direct_url = extract_direct_dl_url(source)
                 raw_url = extract_raw_url(source)
@@ -812,6 +814,45 @@ class LinkToNzbWorkflow:
                     "error": str(exc),
                 })
         return {"title_id": title_id, "count": len(liens), "results": results}
+
+    def _cleanup_stale_download_artifacts(self) -> None:
+        download_root = self.download_dir.resolve()
+        pack_root = (self.download_dir / "_usenet_packs").resolve()
+        if not download_root.exists():
+            return
+
+        paths: list[Path] = []
+        for path in self.download_dir.iterdir():
+            if path.name == "_usenet_packs":
+                continue
+            if path.is_file():
+                paths.append(path)
+
+        if pack_root.exists() and pack_root.is_dir():
+            for path in pack_root.iterdir():
+                if path.is_dir():
+                    paths.append(path)
+                elif path.is_file():
+                    paths.append(path)
+
+        if not paths:
+            return
+
+        total_bytes = 0
+        for path in paths:
+            try:
+                if path.is_dir():
+                    total_bytes += sum(child.stat().st_size for child in path.rglob("*") if child.is_file())
+                elif path.is_file():
+                    total_bytes += path.stat().st_size
+            except OSError:
+                pass
+
+        self._log(
+            "cleanup stale downloads before next link: "
+            f"{len(paths)} item(s), about {total_bytes // (1024 * 1024)} MiB"
+        )
+        self._cleanup_paths(paths)
 
     def _cleanup_paths(self, paths: list[Path]) -> None:
         roots = [self.download_dir.resolve()]
